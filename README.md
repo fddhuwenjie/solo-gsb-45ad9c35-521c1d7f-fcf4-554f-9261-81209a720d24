@@ -1172,9 +1172,121 @@ curl -s -X POST http://localhost:8000/pools/2/provisions \
 #           "detail":"plan_id 'release-1' already provisioned with different parameters"}}
 ```
 
-> 旧版 SQLite 库（`address_provisions.allocation_id` 带 `ON DELETE CASCADE`）启动时会在
-> 单个事务内自动重建该表：`allocation_id` 改为不带外键的历史引用，未释放的开通记录按
-> `plan_id` 原样保留、升级后照常重试；`plan_id` / 池删除级联与请求 id 索引行为不变。
+> **旧版 SQLite 库升级**：更老的库里 `bgp_plans.status` 约束只允许
+> `('planned','active')`（没有 `retired`），且
+> `address_provisions.allocation_id` 还带 `REFERENCES allocations(id) ON DELETE
+> CASCADE`。启动时 `init_db` 会在**同一个事务内协调重建两张表**（临时关闭外键、
+> 复制完全部行并校验后才提交）：先重建任一张都不会再因级联删掉开通记录；计划保留
+> `plan_id` 与原状态，开通保留 `plan_id` / `pool_id` / `allocation_id` /
+> `request_id` 身份与关联，分配行原样不动。任一步失败整体回滚，库里仍是升级前的
+> 旧形态，可修复后重新启动；已经是新形态的库重复启动不做任何改动。升级后原开通请求
+> 返回历史分配、公告与计划**当前状态**（`replayed: true`）。
+
+**旧库情形的可执行示例**（沿用上面的池 1；下面用 SQL 把库"倒回"旧形态来复现
+真实旧库——真实升级场景下这张库由旧版本镜像写出，可跳过倒回步骤，直接用新镜像
+启动）：
+
+```bash
+# 0) 旧版本运行时已存在一条未释放的开通（池 1、order-1、release-1）
+curl -s -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "203.0.113.0/24", "exclusions": []}'
+curl -s -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+
+# 复现旧库形态：bgp_plans 只有 planned/active，address_provisions 的
+# allocation_id 带 ON DELETE CASCADE（行原样保留；真实旧库无需此步）。
+docker compose exec -T api python - <<'PY'
+import sqlite3
+c = sqlite3.connect("/data/subnets.db")
+c.execute("PRAGMA foreign_keys = OFF")
+c.executescript("""
+ALTER TABLE bgp_plans RENAME TO bgp_plans_new;
+DROP INDEX idx_bgp_plans_pool;
+CREATE TABLE bgp_plans (
+  plan_id TEXT PRIMARY KEY,
+  pool_id INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+  params TEXT NOT NULL, audit_results TEXT NOT NULL,
+  pool_state TEXT NOT NULL, state_digest TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('planned','active')),
+  created_at TEXT NOT NULL, activated_at TEXT);
+CREATE INDEX idx_bgp_plans_pool ON bgp_plans(pool_id);
+INSERT INTO bgp_plans SELECT * FROM bgp_plans_new;
+DROP TABLE bgp_plans_new;
+ALTER TABLE address_provisions RENAME TO address_provisions_new;
+DROP INDEX idx_address_provisions_request;
+CREATE TABLE address_provisions (
+  plan_id TEXT PRIMARY KEY REFERENCES bgp_plans(plan_id) ON DELETE CASCADE,
+  pool_id INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+  allocation_id INTEGER NOT NULL REFERENCES allocations(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL, params TEXT NOT NULL, result TEXT NOT NULL,
+  created_at TEXT NOT NULL);
+CREATE INDEX idx_address_provisions_request ON address_provisions(request_id);
+INSERT INTO address_provisions SELECT * FROM address_provisions_new;
+DROP TABLE address_provisions_new;
+""")
+c.commit(); c.close()
+print("legacy schema restored")
+PY
+
+# 1) 升级：用新镜像启动（保持 docker compose 与卷挂载方式不变），
+#    init_db 在启动时自动协调迁移两张表；重复启动不会再动数据。
+docker compose up --build -d
+sleep 2
+
+# 2) 升级前那条未释放开通仍在：原请求返回历史分配、原公告与计划当前状态，
+#    HTTP 200、replayed: true——不再误报 request_id_conflict。
+curl -i -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+# HTTP/1.1 200 OK
+# {"pool_id":1,
+#  "allocation":{"id":1,"cidr":"203.0.113.0/25","request_id":"order-1",
+#                "prefix_length":25,...,"replayed":true},
+#  "plan":{"plan_id":"release-1","status":"planned",...,"replayed":true},
+#  "new_announcement":{"id":"new","prefix":"203.0.113.0/25",...},
+#  "replayed":true}
+
+# 3) 释放后用完全相同的参数重试：仍返回原记录（旧行 id 与原 CIDR），
+#    不会重新占用地址；再查池状态，当前分配列表为空。
+curl -s -X DELETE http://localhost:8000/pools/1/allocations/order-1
+# {"released":"203.0.113.0/25","request_id":"order-1","pool_id":1}
+curl -s -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+# HTTP 200、replayed: true，allocation 仍是 203.0.113.0/25（行 id 1）
+curl -s http://localhost:8000/pools/1
+# {"allocated":[], ...}
+```
+
+升级失败（例如磁盘写满导致重建中断）时事务整体回滚，卷里仍是完整旧库，容器重启后
+会重新执行迁移，不会留下只迁了一半的表；迁移成功后再次 `docker compose restart`
+不会重复迁移、也不会丢失任何计划或开通记录。
 
 ## 错误响应
 
@@ -1290,8 +1402,13 @@ curl -s -X POST http://localhost:8000/pools/2/provisions \
   `planned`、摘要匹配与覆盖重验）与状态翻转（旧计划批量退役、接班计划激活）同样在
   单个 `BEGIN IMMEDIATE` 写事务内完成：并发交接被串行化，恰好一个成功，其余看到
   交接后的状态而冲突；任一核对失败整体回滚，**计划状态不会部分改变**。
-  旧库升级时启动迁移会在单个事务内重建 `bgp_plans` 表以接纳 `retired` 状态，
-  全部 `planned`/`active` 计划（包括同池多条 `active`）按 `plan_id` 原样保留。
+- **旧库结构升级**在启动时（`init_db`）完成：当 `bgp_plans` 仍是只允许
+  `planned`/`active` 的旧约束、或 `address_provisions.allocation_id` 仍带
+  `ON DELETE CASCADE` 时，两张表的重建在**同一个 `BEGIN IMMEDIATE` 事务内协调进行**
+  （迁移期间临时关闭外键）：旧表改名、按现行 DDL 建新表、逐行复制并提交后才删除旧表，
+  任一步失败整体回滚，**不会留下只迁了一半的表**；全部 `planned`/`active` 计划
+  （包括同池多条 `active`）按 `plan_id` 原样保留，未释放的开通记录及其计划、分配的
+  身份与关联也一并保留，两个查询索引同步重建。已是新形态的库重复启动不做任何改动。
 - 批量预留的**全部工作**（`batch_id` 幂等判定、规则编译、一致快照读取、按序选取、
   逐条写入、批次记录）都在单个 `BEGIN IMMEDIATE` 写事务内完成：并发批次被串行化，
   不会选中同一块空闲空间；任一项失败（命中 deny、空间不足、`request_id` 冲突）
@@ -1310,9 +1427,9 @@ curl -s -X POST http://localhost:8000/pools/2/provisions \
   开通绑定记录的生命周期**独立于**其普通分配：`address_provisions.allocation_id` 只是
   历史引用（不带外键级联），`DELETE /pools/{id}/allocations/{request_id}` 释放分配后记录
   仍在，相同 `plan_id` 同参重试照旧重放原结果而不重新选址占用；仅在计划或池被删除时记录
-  才随级联移除。旧库升级时启动迁移会在单个事务内重建 `address_provisions` 表以解除该
-  级联，未释放的开通记录按 `plan_id` 原样保留、升级后仍可重试，按 request_id 的查询索引
-  同步重建。
+  才随级联移除。旧库升级时 `address_provisions` 与 `bgp_plans` 在同一个协调事务内
+  一起重建以解除该级联（见上一条"旧库结构升级"），未释放的开通记录按 `plan_id`
+  原样保留、升级后仍可重试，按 request_id 的查询索引同步重建。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构

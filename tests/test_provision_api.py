@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 
+import pytest
 from fastapi.testclient import TestClient
 
 RELATIONSHIPS = [
@@ -684,6 +685,22 @@ def test_standalone_allocations_plans_and_handover_keep_working_after_release(cl
 # Schema migration of databases whose provisions cascaded with allocations
 # ---------------------------------------------------------------------------
 
+# The bgp_plans table as created before the handover feature existed.
+_LEGACY_BGP_PLANS_DDL = """
+CREATE TABLE bgp_plans (
+    plan_id          TEXT    PRIMARY KEY,
+    pool_id          INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+    params           TEXT    NOT NULL,
+    audit_results    TEXT    NOT NULL,
+    pool_state       TEXT    NOT NULL,
+    state_digest     TEXT    NOT NULL,
+    status           TEXT    NOT NULL CHECK (status IN ('planned', 'active')),
+    created_at       TEXT    NOT NULL,
+    activated_at     TEXT
+);
+CREATE INDEX idx_bgp_plans_pool ON bgp_plans(pool_id);
+"""
+
 # The address_provisions table as created before released provisions had to
 # stay replayable: allocation_id carried ON DELETE CASCADE.
 _LEGACY_ADDRESS_PROVISIONS_DDL = """
@@ -699,6 +716,58 @@ CREATE TABLE address_provisions (
 );
 CREATE INDEX idx_address_provisions_request ON address_provisions(request_id);
 """
+
+
+def _rewind_to_dual_legacy_db(db_path):
+    """Rewind both tables to their pre-handover/pre-release definitions.
+
+    A genuinely old database has the old DDL on disk with live rows; the
+    rewrite keeps the rows by suspending foreign-key enforcement (otherwise
+    dropping the renamed plans copy cascades the provisions away, which is
+    exactly the upgrade bug under test).
+    """
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
+            "ALTER TABLE bgp_plans RENAME TO bgp_plans_new;\n"
+            "DROP INDEX idx_bgp_plans_pool;\n"
+            + _LEGACY_BGP_PLANS_DDL
+            + """
+            INSERT INTO bgp_plans (plan_id, pool_id, params, audit_results,
+                pool_state, state_digest, status, created_at, activated_at)
+            SELECT plan_id, pool_id, params, audit_results, pool_state,
+                state_digest, status, created_at, activated_at
+            FROM bgp_plans_new;
+            DROP TABLE bgp_plans_new;
+
+            ALTER TABLE address_provisions RENAME TO address_provisions_new;
+            DROP INDEX idx_address_provisions_request;
+            """
+            + _LEGACY_ADDRESS_PROVISIONS_DDL
+            + """
+            INSERT INTO address_provisions (plan_id, pool_id, allocation_id,
+                request_id, params, result, created_at)
+            SELECT plan_id, pool_id, allocation_id, request_id, params, result,
+                created_at FROM address_provisions_new;
+            DROP TABLE address_provisions_new;
+            """
+        )
+        conn.commit()
+        plans_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='bgp_plans'"
+        ).fetchone()[0]
+        provisions_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='address_provisions'"
+        ).fetchone()[0]
+        assert "'retired'" not in plans_sql
+        assert "REFERENCES allocations" in provisions_sql
+        assert conn.execute("SELECT count(*) FROM address_provisions").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_legacy_provision_table_is_migrated_and_remains_replayable(
@@ -797,3 +866,204 @@ def test_legacy_provision_table_is_migrated_and_remains_replayable(
         assert data["allocation"]["id"] == allocation_id
         assert data["allocation"]["cidr"] == "203.0.113.0/25"
         assert client.get(f"/pools/{pid}").json()["allocated"] == []
+
+
+# ---------------------------------------------------------------------------
+# Coordinated upgrade of a database predating BOTH the retired status and
+# the non-cascading allocation_id
+# ---------------------------------------------------------------------------
+
+
+def test_dual_legacy_database_keeps_provisions_on_upgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "dual-legacy.db"
+    monkeypatch.setenv("SUBNET_DB_PATH", str(db_path))
+    from app import db as db_module
+
+    monkeypatch.setattr(db_module, "DB_PATH", str(db_path))
+    db_module.init_db()
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        pid = _create_pool(client)
+        first = _provision(client, pid, _body())
+        assert first.status_code == 201, first.text
+        original = first.json()
+        allocation_id = original["allocation"]["id"]
+        assert original["plan"]["status"] == "planned"
+
+    # Simulate a database created before both features existed: bgp_plans
+    # only knows planned/active, and address_provisions.allocation_id
+    # cascades.  The un-released provision row stays in place.
+    _rewind_to_dual_legacy_db(db_path)
+
+    # The upgrade rebuilds both tables in one coordinated transaction and
+    # preserves the identity and linkage of every row.
+    db_module.init_db()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        plans_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='bgp_plans'"
+        ).fetchone()[0]
+        provisions_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='address_provisions'"
+        ).fetchone()[0]
+        assert "'retired'" in plans_sql
+        assert "REFERENCES allocations" not in provisions_sql
+        assert "REFERENCES bgp_plans" in provisions_sql
+
+        plans = conn.execute("SELECT plan_id, status FROM bgp_plans").fetchall()
+        assert plans == [("plan-1", "planned")]
+        provision = conn.execute(
+            "SELECT plan_id, pool_id, allocation_id, request_id "
+            "FROM address_provisions"
+        ).fetchone()
+        assert tuple(provision) == ("plan-1", pid, allocation_id, "order-1")
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name IN ('bgp_plans', 'address_provisions')"
+            )
+        }
+        assert "idx_bgp_plans_pool" in indexes
+        assert "idx_address_provisions_request" in indexes
+    finally:
+        conn.close()
+
+    # The original request replays its historical allocation and announcement
+    # together with the plan's current status; it is not mistaken for a fresh
+    # request_id collision (the pre-fix bug).
+    with TestClient(app) as client:
+        replay = _provision(client, pid, _body())
+        assert replay.status_code == 200, replay.text
+        data = replay.json()
+        assert data["replayed"] is True
+        assert data["allocation"]["id"] == allocation_id
+        assert data["allocation"]["cidr"] == "203.0.113.0/25"
+        assert data["new_announcement"]["prefix"] == "203.0.113.0/25"
+        assert data["plan"]["plan_id"] == "plan-1"
+        assert data["plan"]["status"] == "planned"
+
+        # The plan is still an ordinary bgp_plans row: activate it, hand it
+        # over to a successor, and the subsequent replay surfaces the current
+        # retired status.
+        activate = client.post(f"/pools/{pid}/bgp-plans/plan-1/activate")
+        assert activate.status_code == 200, activate.text
+        plan_body = {
+            "plan_id": "plan-2",
+            "relationships": [
+                {"type": "customer_provider", "customer": 10, "provider": 100}
+            ],
+            "announcements": [
+                {"id": "new", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+            ],
+        }
+        assert (
+            client.post(f"/pools/{pid}/bgp-plans", json=plan_body).status_code
+            == 201
+        )
+        handover = client.post(
+            f"/pools/{pid}/bgp-plans/handover",
+            json={"old_plan_ids": ["plan-1"], "new_plan_id": "plan-2"},
+        )
+        assert handover.status_code == 200, handover.text
+        replay_after_handover = _provision(client, pid, _body())
+        assert replay_after_handover.status_code == 200
+        assert replay_after_handover.json()["replayed"] is True
+        assert replay_after_handover.json()["plan"]["status"] == "retired"
+
+        # Release then same-parameters retry: the stored record replays and
+        # the freed address is never re-occupied.
+        assert _release(client, pid, "order-1") == "203.0.113.0/25"
+        replay_after_release = _provision(client, pid, _body())
+        assert replay_after_release.status_code == 200
+        data = replay_after_release.json()
+        assert data["replayed"] is True
+        assert data["allocation"]["id"] == allocation_id
+        assert data["allocation"]["cidr"] == "203.0.113.0/25"
+        assert client.get(f"/pools/{pid}").json()["allocated"] == []
+
+
+def test_dual_legacy_upgrade_is_idempotent_and_failure_leaves_legacy_intact(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "dual-legacy-atomic.db"
+    monkeypatch.setenv("SUBNET_DB_PATH", str(db_path))
+    from app import db as db_module
+
+    monkeypatch.setattr(db_module, "DB_PATH", str(db_path))
+    db_module.init_db()
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        pid = _create_pool(client)
+        first = _provision(client, pid, _body())
+        assert first.status_code == 201, first.text
+        allocation_id = first.json()["allocation"]["id"]
+
+    _rewind_to_dual_legacy_db(db_path)
+
+    # Break the plans rebuild statement (the migration reads this DDL
+    # constant): the rename succeeds inside the transaction, then the CREATE
+    # fails.  The coordinated rebuild must roll the rename back as well.
+    original_ddl = db_module._BGP_PLANS_DDL
+    db_module._BGP_PLANS_DDL = "CREATE TABLE bgp_plans (bad"
+
+    with pytest.raises(sqlite3.Error):
+        db_module.init_db()
+    db_module._BGP_PLANS_DDL = original_ddl
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "bgp_plans" in names
+        assert "address_provisions" in names
+        assert "bgp_plans_legacy" not in names
+        assert "address_provisions_legacy" not in names
+
+        plans_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='bgp_plans'"
+        ).fetchone()[0]
+        provisions_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='address_provisions'"
+        ).fetchone()[0]
+        assert "'retired'" not in plans_sql
+        assert "REFERENCES allocations" in provisions_sql
+        assert conn.execute("SELECT count(*) FROM bgp_plans").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT count(*) FROM address_provisions").fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+    # The retry completes the upgrade; an immediately repeated init is a
+    # no-op that keeps the records.
+    db_module.init_db()
+    db_module.init_db()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT plan_id, status FROM bgp_plans").fetchone() == (
+            "plan-1",
+            "planned",
+        )
+        assert tuple(
+            conn.execute(
+                "SELECT plan_id, allocation_id, request_id FROM address_provisions"
+            ).fetchone()
+        ) == ("plan-1", allocation_id, "order-1")
+    finally:
+        conn.close()
