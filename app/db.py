@@ -52,89 +52,133 @@ _ADDRESS_PROVISIONS_DDL = """
 """
 
 
-def _migrate_bgp_plans(conn: sqlite3.Connection) -> None:
-    """Rebuild ``bgp_plans`` when it predates the ``retired`` status.
-
-    Databases created before plan handover constrain ``status`` to
-    ``('planned', 'active')``, and SQLite cannot alter a CHECK constraint,
-    so the table is rebuilt inside one transaction.  Every row -- planned
-    or active, including pools that hold several active plans -- is copied
-    verbatim and keeps its ``plan_id`` identity.
-    """
+def _legacy_bgp_plans(conn: sqlite3.Connection) -> bool:
+    """Whether ``bgp_plans`` predates the ``retired`` status."""
 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bgp_plans'"
     ).fetchone()
-    if row is None or "'retired'" in row["sql"]:
-        return  # fresh database (created below) or already migrated
-
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("ALTER TABLE bgp_plans RENAME TO bgp_plans_legacy")
-        conn.execute(_BGP_PLANS_DDL)
-        conn.execute(
-            "INSERT INTO bgp_plans (plan_id, pool_id, params, audit_results, "
-            "pool_state, state_digest, status, created_at, activated_at) "
-            "SELECT plan_id, pool_id, params, audit_results, pool_state, "
-            "state_digest, status, created_at, activated_at "
-            "FROM bgp_plans_legacy"
-        )
-        # Dropping the legacy table also drops its indexes (notably
-        # idx_bgp_plans_pool); init_db recreates them on the new table.
-        conn.execute("DROP TABLE bgp_plans_legacy")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    return row is not None and "'retired'" not in row["sql"]
 
 
-def _migrate_address_provisions(conn: sqlite3.Connection) -> None:
-    """Rebuild ``address_provisions`` when ``allocation_id`` cascades.
+def _legacy_address_provisions(conn: sqlite3.Connection) -> bool:
+    """Whether ``address_provisions.allocation_id`` still cascades.
 
-    The original schema declared
-    ``allocation_id INTEGER NOT NULL REFERENCES allocations(id) ON DELETE
-    CASCADE``, so releasing a provisioned allocation (``DELETE
-    /pools/{id}/allocations/{request_id}``) deleted the linkage record too:
-    the ``bgp_plans`` row survived, and an identical retry could no longer
-    find its provision and failed with ``bgp_plan_id_conflict`` instead of
-    replaying.
-
-    Provision records must outlive the release of their allocation -- the
-    stored result, the plan and the idempotency key stay replayable -- so the
-    rebuilt table keeps ``allocation_id`` as a plain historical reference
-    without a foreign key, exactly like the unmigratable source references in
-    ``pool_migrations``.  ``plan_id`` and ``pool_id`` still cascade (deleting
-    the plan or the pool removes the record); every row, including ones whose
-    allocation has already been released in an old database, is copied
-    verbatim.
+    The new definition has no REFERENCES clause on ``allocation_id`` at all.
     """
 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'address_provisions'"
     ).fetchone()
-    # Fresh database (created below) or already migrated: the new definition
-    # has no REFERENCES clause on allocation_id at all.
-    if row is None or "REFERENCES allocations" not in row["sql"]:
-        return
+    return row is not None and "REFERENCES allocations" in row["sql"]
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("ALTER TABLE address_provisions RENAME TO address_provisions_legacy")
-        conn.execute(_ADDRESS_PROVISIONS_DDL)
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return (
         conn.execute(
-            "INSERT INTO address_provisions (plan_id, pool_id, allocation_id, "
-            "request_id, params, result, created_at) "
-            "SELECT plan_id, pool_id, allocation_id, request_id, params, result, "
-            "created_at FROM address_provisions_legacy"
-        )
-        # Dropping the legacy table also drops its indexes (notably
-        # idx_address_provisions_request); init_db recreates them on the new
-        # table.
-        conn.execute("DROP TABLE address_provisions_legacy")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
+    """Rebuild the legacy ``bgp_plans`` / ``address_provisions`` tables together.
+
+    The two old schemas cannot be rebuilt independently: the legacy
+    ``address_provisions`` declared ``plan_id ... REFERENCES bgp_plans(plan_id)
+    ON DELETE CASCADE`` and ``allocation_id INTEGER NOT NULL REFERENCES
+    allocations(id) ON DELETE CASCADE``, so dropping a renamed-away legacy
+    ``bgp_plans`` while foreign keys are enforced cascades every provision
+    record away.  An upgrade on a database carrying an un-released provision
+    therefore lost the linkage row: the allocation and plan survived, and the
+    identical request could no longer replay -- it failed with
+    ``request_id_conflict`` against the surviving allocation, and once the
+    allocation was released a retry hit ``bgp_plan_id_conflict`` against the
+    surviving plan.
+
+    Everything that needs rebuilding is therefore rebuilt in **one**
+    transaction with foreign-key enforcement suspended for its duration (a
+    ``PRAGMA foreign_keys`` change is only effective outside a transaction):
+    old tables renamed away, new tables created, every row copied verbatim
+    (each keeps its primary-key identity and the plan/allocation/pool links)
+    and the legacy tables dropped before the commit.  Any failure rolls the
+    whole batch back -- no table ends up half-rebuilt -- and a repeated run
+    simply performs the still-pending rebuild.
+
+    Rebuilding ``bgp_plans`` also forces a rebuild of ``address_provisions``
+    when that table exists, even if its own schema is already current: the
+    rename of the referenced table would otherwise leave the provision table
+    dangling on the soon-dropped legacy name.
+
+    A copy whose ``allocation_id`` points at an already-released allocation is
+    expected and kept: the rebuilt table treats it as a non-FK historical
+    reference precisely so such a release stays replayable.
+    """
+
+    plans_legacy = _legacy_bgp_plans(conn)
+    provisions_legacy = _legacy_address_provisions(conn)
+    if not plans_legacy and not provisions_legacy:
+        return  # fresh database (created below) or already migrated
+
+    provisions_exist = _table_exists(conn, "address_provisions")
+    rebuild_plans = plans_legacy
+    rebuild_provisions = provisions_legacy or (plans_legacy and provisions_exist)
+
+    # Foreign-key enforcement is per connection and may only be toggled while
+    # no transaction is open; init_db owns this short-lived connection, so the
+    # suspension never leaks to application traffic.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if rebuild_plans:
+                conn.execute("ALTER TABLE bgp_plans RENAME TO bgp_plans_legacy")
+                conn.execute(_BGP_PLANS_DDL)
+                conn.execute(
+                    "INSERT INTO bgp_plans (plan_id, pool_id, params, audit_results, "
+                    "pool_state, state_digest, status, created_at, activated_at) "
+                    "SELECT plan_id, pool_id, params, audit_results, pool_state, "
+                    "state_digest, status, created_at, activated_at "
+                    "FROM bgp_plans_legacy"
+                )
+            if rebuild_provisions:
+                # With the (possibly also renamed) plans table out of the way
+                # the old table cannot cascade on anything during the rebuild.
+                conn.execute(
+                    "ALTER TABLE address_provisions RENAME TO address_provisions_legacy"
+                )
+                conn.execute(_ADDRESS_PROVISIONS_DDL)
+                conn.execute(
+                    "INSERT INTO address_provisions (plan_id, pool_id, allocation_id, "
+                    "request_id, params, result, created_at) "
+                    "SELECT plan_id, pool_id, allocation_id, request_id, params, result, "
+                    "created_at FROM address_provisions_legacy"
+                )
+            # No PRAGMA foreign_key_check here on purpose: an old database that
+            # released a provisioned allocation kept the bgp_plans row while the
+            # legacy cascading allocation_id FK had already deleted the provision
+            # row (exactly the historical state the new table tolerates).  Every
+            # surviving copy -- the only kind that reaches this code -- resolves
+            # under the rebuilt schema, whose allocation_id is a deliberately
+            # non-FK historical reference; an allocation_id that points at a
+            # deleted allocation is a valid replay anchor, not a violation.
+            #
+            # Dropping the legacy tables also drops their indexes (notably
+            # idx_bgp_plans_pool / idx_address_provisions_request); the
+            # CREATE INDEX statements in init_db recreate them on the new
+            # tables.  Order is irrelevant with enforcement suspended.
+            if rebuild_provisions:
+                conn.execute("DROP TABLE address_provisions_legacy")
+            if rebuild_plans:
+                conn.execute("DROP TABLE bgp_plans_legacy")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _connect() -> sqlite3.Connection:
@@ -158,8 +202,7 @@ def _connect() -> sqlite3.Connection:
 
 def init_db() -> None:
     with get_conn() as conn:
-        _migrate_bgp_plans(conn)
-        _migrate_address_provisions(conn)
+        _migrate_legacy_tables(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS pools (

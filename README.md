@@ -92,6 +92,10 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/bgp-plans/handover` | 单写事务内将池全部活动计划交接给一份 planned 接班计划（旧计划退役、新计划激活） |
 | `GET` | `/health` | 健康检查 |
 
+> 启动时自动完成旧版 SQLite 库升级（`bgp_plans` 接纳 `retired` 状态、
+> `address_provisions.allocation_id` 解除删除级联）：两表在同一事务内协调重建，保留
+> 计划、分配与开通记录的身份和关联，详见[第 18 节](#18-旧版-sqlite-库升级保留计划分配与开通记录)。
+
 ### 1. 创建地址池
 
 ```bash
@@ -1172,9 +1176,140 @@ curl -s -X POST http://localhost:8000/pools/2/provisions \
 #           "detail":"plan_id 'release-1' already provisioned with different parameters"}}
 ```
 
-> 旧版 SQLite 库（`address_provisions.allocation_id` 带 `ON DELETE CASCADE`）启动时会在
-> 单个事务内自动重建该表：`allocation_id` 改为不带外键的历史引用，未释放的开通记录按
-> `plan_id` 原样保留、升级后照常重试；`plan_id` / 池删除级联与请求 id 索引行为不变。
+### 18. 旧版 SQLite 库升级（保留计划、分配与开通记录）
+
+启动时 `init_db()` 会识别两类旧表并在**同一个事务**内协调重建，升级期间暂停
+外键强制，因此任一失败都整体回滚、不会留下半迁移的库；重复启动也不会丢记录：
+
+- `bgp_plans.status` 的旧 `CHECK` 只允许 `('planned', 'active')`（交接功能出现
+  之前）→ 重建为允许 `retired` 的现行定义；
+- `address_provisions.allocation_id` 仍带 `REFERENCES allocations(id) ON DELETE
+  CASCADE`（释放后开通记录仍可重放之前）→ 重建为不带该外键的历史引用，
+  `plan_id` / `pool_id` 的级联与 request_id 索引行为不变。
+
+这两张表必须一起迁移：旧 `address_provisions.plan_id` 对 `bgp_plans` 也带
+`ON DELETE CASCADE`，若先重建 `bgp_plans`，删除旧表的瞬间会把**库中尚未释放的
+开通记录级联清空**——分配与计划行还在，原请求却因存活的分配报
+`409 request_id_conflict`，把分配释放后再重试又因存活的计划报
+`409 bgp_plan_id_conflict`，历史结果再也无法回放。协调迁移后，每条计划、分配与
+开通记录的主键身份和相互关联逐行保留：`plan_id`、`allocation_id`、`request_id`、
+创建时间与存储结果都不变，计划保留其当前状态。
+
+升级后用**原来的 `plan_id` + 相同参数**再次调用开通接口，返回历史分配（旧分配行
+id 与原 CIDR）、原公告与计划的**当前状态**，HTTP 200、各级 `replayed: true`；
+释放地址后同参重试仍是这条历史结果，**不会重新占用**已释放地址。
+
+**旧库情形的可执行示例**：先用新版本的镜像初始化库并开通一次，然后停止服务、把库
+中的两张表退回旧定义（模拟带未释放开通的旧库），再重新启动并验证升级行为。
+
+```bash
+# 0) 启动服务（接口与 docker compose 启动方式不变）
+docker compose up --build -d
+sleep 2
+
+# 1) 建池并一次性开通（pool_id 以实际返回为准，下面假设为 1）
+curl -s -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "203.0.113.0/24", "exclusions": []}'
+
+curl -s -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+
+# 2) 停止服务，把两张表退回旧定义（外键强制关闭，保留已有的计划与开通行）
+docker compose stop api
+docker run --rm -i --entrypoint python3 -v subnet-allocator_subnet-data:/data \
+  subnet-allocator:latest - <<'PY'
+import sqlite3
+conn = sqlite3.connect("/data/subnets.db")
+conn.execute("PRAGMA foreign_keys = OFF")
+conn.executescript("""
+ALTER TABLE bgp_plans RENAME TO _plans;
+DROP INDEX idx_bgp_plans_pool;
+CREATE TABLE bgp_plans (
+    plan_id TEXT PRIMARY KEY,
+    pool_id INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+    params TEXT NOT NULL, audit_results TEXT NOT NULL, pool_state TEXT NOT NULL,
+    state_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('planned','active')),
+    created_at TEXT NOT NULL, activated_at TEXT
+);
+CREATE INDEX idx_bgp_plans_pool ON bgp_plans(pool_id);
+INSERT INTO bgp_plans (plan_id, pool_id, params, audit_results, pool_state,
+    state_digest, status, created_at, activated_at)
+SELECT plan_id, pool_id, params, audit_results, pool_state, state_digest,
+    status, created_at, activated_at FROM _plans;
+DROP TABLE _plans;
+
+ALTER TABLE address_provisions RENAME TO _provs;
+DROP INDEX idx_address_provisions_request;
+CREATE TABLE address_provisions (
+    plan_id TEXT PRIMARY KEY REFERENCES bgp_plans(plan_id) ON DELETE CASCADE,
+    pool_id INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+    allocation_id INTEGER NOT NULL REFERENCES allocations(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL, params TEXT NOT NULL, result TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_address_provisions_request ON address_provisions(request_id);
+INSERT INTO address_provisions (plan_id, pool_id, allocation_id, request_id,
+    params, result, created_at)
+SELECT plan_id, pool_id, allocation_id, request_id, params, result, created_at
+FROM _provs;
+DROP TABLE _provs;
+""")
+conn.commit()
+print("rolled back to legacy schema:",
+      conn.execute("SELECT COUNT(*) FROM address_provisions").fetchone()[0],
+      "provision row(s) kept")
+conn.close()
+PY
+
+# 3) 重新启动：启动日志不报错，两张表在同一事务内升级完成
+docker compose up -d
+sleep 2
+
+# 4) 用原来的 plan_id + 相同参数重试：HTTP 200、replayed: true，
+#    返回历史分配（原分配行 id、203.0.113.0/25）、原公告与计划当前状态
+curl -s -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+
+# 5) 释放后再用同参重试：仍然回放历史结果，地址不会被重新占用
+curl -s -X DELETE http://localhost:8000/pools/1/allocations/order-1
+curl -s http://localhost:8000/pools/1          # allocated 为空
+curl -s -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+# -> {"replayed": true, "allocation": {"id": <原行id>, "cidr": "203.0.113.0/25", ...}}
+```
+
+> 说明：上面第 2 步只是构造旧库的演练手段；生产升级只需用新镜像执行
+> `docker compose up --build -d`，首次启动自动完成上述协调迁移。命名卷
+> `subnet-data`（容器内 `/data/subnets.db`）中的历史数据在镜像替换后仍然存在。
 
 ## 错误响应
 
@@ -1290,8 +1425,8 @@ curl -s -X POST http://localhost:8000/pools/2/provisions \
   `planned`、摘要匹配与覆盖重验）与状态翻转（旧计划批量退役、接班计划激活）同样在
   单个 `BEGIN IMMEDIATE` 写事务内完成：并发交接被串行化，恰好一个成功，其余看到
   交接后的状态而冲突；任一核对失败整体回滚，**计划状态不会部分改变**。
-  旧库升级时启动迁移会在单个事务内重建 `bgp_plans` 表以接纳 `retired` 状态，
-  全部 `planned`/`active` 计划（包括同池多条 `active`）按 `plan_id` 原样保留。
+  旧库升级时启动迁移会重建 `bgp_plans` 表以接纳 `retired` 状态，全部
+  `planned`/`active` 计划（包括同池多条 `active`）按 `plan_id` 原样保留。
 - 批量预留的**全部工作**（`batch_id` 幂等判定、规则编译、一致快照读取、按序选取、
   逐条写入、批次记录）都在单个 `BEGIN IMMEDIATE` 写事务内完成：并发批次被串行化，
   不会选中同一块空闲空间；任一项失败（命中 deny、空间不足、`request_id` 冲突）
@@ -1310,9 +1445,12 @@ curl -s -X POST http://localhost:8000/pools/2/provisions \
   开通绑定记录的生命周期**独立于**其普通分配：`address_provisions.allocation_id` 只是
   历史引用（不带外键级联），`DELETE /pools/{id}/allocations/{request_id}` 释放分配后记录
   仍在，相同 `plan_id` 同参重试照旧重放原结果而不重新选址占用；仅在计划或池被删除时记录
-  才随级联移除。旧库升级时启动迁移会在单个事务内重建 `address_provisions` 表以解除该
-  级联，未释放的开通记录按 `plan_id` 原样保留、升级后仍可重试，按 request_id 的查询索引
-  同步重建。
+  才随级联移除。旧库升级时 `bgp_plans`（接纳 `retired` 状态）与
+  `address_provisions`（解除 allocation_id 级联）的重建在**同一个事务、暂停外键
+  强制期间**协调完成：旧表先改名、新表建好、行逐列原样复制、最后才删旧表，避免删除
+  旧计划表时经 `plan_id` 级联清掉未释放的开通记录；任一步失败整体回滚，不留下半迁移
+  的库，重复启动也不会丢记录。升级后未释放/已释放的开通都按 `plan_id` 原样保留、仍可
+  同参重试，两张表的索引（按 pool / request_id 查询）同步重建。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
